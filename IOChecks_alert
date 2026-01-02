@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Required env vars:
+: "${PUSHOVER_TOKEN:?set PUSHOVER_TOKEN}"
+: "${PUSHOVER_USER:?set PUSHOVER_USER}"
+
+HOST="${HOST:-$(hostname)}"
+TITLE="${TITLE:-[$HOST] Kernel / Storage Alert}"
+
+# Rate limit
+MIN_INTERVAL="${MIN_INTERVAL:-30}"     # seconds between notifications
+BURST_MAX="${BURST_MAX:-3}"            # allow up to N alerts quickly
+BURST_WINDOW="${BURST_WINDOW:-120}"    # seconds
+LAST_SENT=0
+BURST_COUNT=0
+BURST_START=0
+
+# Patterns worth paging you for (edit freely)
+PATTERN="${PATTERN:-nfs: server .* not responding|I/O error|blk_update_request|ata[0-9]+: hard resetting link|BadCRC|interface fatal error|SATA link down|XFS .*Shutting down|metadata I/O error|Buffer I/O error|read-only}"
+
+send_pushover() {
+  local msg="$1"
+
+  # Pushover message limit is 1024 chars
+  if ((${#msg} > 1000)); then
+    msg="${msg:0:1000}…"
+  fi
+
+  curl -sS \
+    -F "token=$PUSHOVER_TOKEN" \
+    -F "user=$PUSHOVER_USER" \
+    -F "title=$TITLE" \
+    -F "priority=1" \
+    -F "message=$msg" \
+    https://api.pushover.net/1/messages.json >/dev/null 2>&1 || true
+}
+
+should_send() {
+  local now
+  now="$(date +%s)"
+
+  # reset burst window
+  if (( now - BURST_START > BURST_WINDOW )); then
+    BURST_START="$now"
+    BURST_COUNT=0
+  fi
+
+  # allow a small burst
+  if (( BURST_COUNT < BURST_MAX )); then
+    BURST_COUNT=$((BURST_COUNT + 1))
+    LAST_SENT="$now"
+    return 0
+  fi
+
+  # then enforce min interval
+  if (( now - LAST_SENT < MIN_INTERVAL )); then
+    return 1
+  fi
+
+  LAST_SENT="$now"
+  return 0
+}
+
+# Follow kernel log and filter interesting lines
+journalctl -k -f -n 0 | while IFS= read -r line; do
+  if echo "$line" | grep -Eqi "$PATTERN"; then
+    if should_send; then
+      send_pushover "[$HOST] $line"
+    fi
+  fi
+done
